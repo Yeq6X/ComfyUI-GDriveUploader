@@ -1,17 +1,30 @@
 import os
 import json
-import mimetypes
 import zipfile
 import tempfile
-from typing import Tuple, List
-from google.oauth2 import service_account
+import pickle
+import webbrowser
+from typing import Tuple, List, Optional
+from datetime import datetime
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
+# スコープ設定
+SCOPES = ['https://www.googleapis.com/auth/drive']
 
-class GDriveUpload:
+# トークン保存先
+TOKEN_DIR = os.path.expanduser("~/.comfyui-gdrive")
+TOKEN_PATH = os.path.join(TOKEN_DIR, "token.pickle")
+CREDENTIALS_PATH = os.path.join(TOKEN_DIR, "credentials.json")
+
+
+class GDriveUploadOAuth:
     """
-    Google Drive アップロードノード（Service Account JSON直接入力版）
+    Google Drive アップロードノード（OAuth2.0認証版）
     """
     @classmethod
     def INPUT_TYPES(cls):
@@ -25,23 +38,22 @@ class GDriveUpload:
                 "parent_folder_id": ("STRING", {
                     "default": "",
                     "multiline": False,
-                    "placeholder": "Google DriveフォルダID (例: 1AbCdEfG...)"
-                }),
-                "service_account_json": ("STRING", {
-                    "default": "",
-                    "multiline": True,
-                    "placeholder": "Service Account JSONの内容を貼り付け"
+                    "placeholder": "Google DriveフォルダID (空欄でルート)"
                 }),
             },
             "optional": {
-                "share_with_email": ("STRING", {
+                "credentials_json": ("STRING", {
                     "default": "",
-                    "multiline": False,
-                    "placeholder": "共有先メールアドレス（オプション）"
+                    "multiline": True,
+                    "placeholder": "OAuth2.0 credentials.json（初回のみ必要）"
                 }),
                 "compress_folder": ("BOOLEAN", {
                     "default": True,
-                    "label": "フォルダをzipに圧縮してアップロード"
+                    "label": "フォルダをzipに圧縮"
+                }),
+                "create_parent_folder": ("BOOLEAN", {
+                    "default": True,
+                    "label": "アップロードフォルダ名で親フォルダを作成"
                 }),
             }
         }
@@ -52,84 +64,141 @@ class GDriveUpload:
     CATEGORY = "IO/Cloud"
     OUTPUT_NODE = True
 
-    def _load_credentials(self, service_account_json: str):
-        """Service Account JSONから認証情報を読み込み"""
-        scopes = ["https://www.googleapis.com/auth/drive"]
+    def _get_credentials(self, credentials_json: str = "") -> Optional[Credentials]:
+        """OAuth2.0認証情報を取得"""
         
-        if not service_account_json.strip():
-            raise ValueError("Service Account JSONが入力されていません")
+        # トークンディレクトリの作成
+        if not os.path.exists(TOKEN_DIR):
+            os.makedirs(TOKEN_DIR)
         
-        try:
-            info = json.loads(service_account_json)
-            return service_account.Credentials.from_service_account_info(info, scopes=scopes)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"JSONの解析に失敗しました: {e}")
-        except Exception as e:
-            raise ValueError(f"認証情報の読み込みに失敗しました: {e}")
-
-    def _get_mime_type(self, path: str) -> str:
-        """ファイルのMIMEタイプを推定"""
-        mime_type, _ = mimetypes.guess_type(path)
-        return mime_type or "application/octet-stream"
+        creds = None
+        
+        # 既存のトークンを読み込み
+        if os.path.exists(TOKEN_PATH):
+            with open(TOKEN_PATH, 'rb') as token:
+                creds = pickle.load(token)
+        
+        # トークンが無効または存在しない場合
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                # トークンをリフレッシュ
+                print("認証トークンを更新中...")
+                creds.refresh(Request())
+            else:
+                # 新規認証が必要
+                if credentials_json.strip():
+                    # UIから提供されたcredentials.jsonを使用
+                    print("新しい認証情報で認証を開始...")
+                    try:
+                        credentials_info = json.loads(credentials_json)
+                        # 一時ファイルに保存
+                        temp_cred_path = os.path.join(TOKEN_DIR, "temp_credentials.json")
+                        with open(temp_cred_path, 'w') as f:
+                            json.dump(credentials_info, f)
+                        
+                        flow = InstalledAppFlow.from_client_secrets_file(
+                            temp_cred_path, SCOPES
+                        )
+                        
+                        # ローカルサーバーで認証（ポート0で自動選択）
+                        creds = flow.run_local_server(port=0)
+                        
+                        # 永続的な場所に保存
+                        with open(CREDENTIALS_PATH, 'w') as f:
+                            json.dump(credentials_info, f)
+                        
+                        # 一時ファイルを削除
+                        os.remove(temp_cred_path)
+                        
+                    except Exception as e:
+                        return None
+                        
+                elif os.path.exists(CREDENTIALS_PATH):
+                    # 保存済みのcredentials.jsonを使用
+                    print("保存済みの認証情報で認証を開始...")
+                    flow = InstalledAppFlow.from_client_secrets_file(
+                        CREDENTIALS_PATH, SCOPES
+                    )
+                    creds = flow.run_local_server(port=0)
+                else:
+                    print("エラー: credentials.jsonが必要です")
+                    print(f"1. Google Cloud ConsoleでOAuth2.0クライアントIDを作成")
+                    print(f"2. credentials.jsonをダウンロード")
+                    print(f"3. ノードのcredentials_json欄に貼り付け")
+                    return None
+            
+            # トークンを保存
+            if creds:
+                with open(TOKEN_PATH, 'wb') as token:
+                    pickle.dump(creds, token)
+                print("認証成功！トークンを保存しました")
+        
+        return creds
 
     def _create_zip_from_folder(self, folder_path: str) -> str:
-        """フォルダをzipファイルに圧縮して一時ファイルパスを返す"""
-        # 一時ファイルを作成
+        """フォルダをzipファイルに圧縮"""
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
         temp_path = temp_file.name
         temp_file.close()
         
-        # zipファイルを作成
         with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for root, dirs, files in os.walk(folder_path):
                 for file in files:
                     file_path = os.path.join(root, file)
-                    # アーカイブ内のパスを相対パスにする
                     arcname = os.path.relpath(file_path, folder_path)
                     zipf.write(file_path, arcname)
         
         return temp_path
 
     def _get_zip_filename(self, folder_path: str) -> str:
-        """フォルダ名からzipファイル名を生成"""
+        """zipファイル名を生成"""
         folder_name = os.path.basename(folder_path)
-        from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"{folder_name}_{timestamp}.zip"
-    
-    def _share_file(self, drive_service, file_id: str, email: str):
-        """ファイルを指定のメールアドレスと共有"""
-        if not email:
-            return
+
+    def _create_folder_structure(self, drive_service, base_path: str, file_path: str, parent_id: str) -> str:
+        """フォルダ構造を作成（OAuthなら安全）"""
+        rel_path = os.path.relpath(os.path.dirname(file_path), base_path)
         
-        try:
-            permission = {
-                "type": "user",
-                "role": "writer",
-                "emailAddress": email
-            }
-            drive_service.permissions().create(
-                fileId=file_id,
-                body=permission,
-                sendNotificationEmail=False
-            ).execute()
-        except Exception as e:
-            print(f"共有設定に失敗しました: {e}")
+        if rel_path == ".":
+            return parent_id if parent_id else "root"
+        
+        folders = rel_path.split(os.sep)
+        current_parent = parent_id if parent_id else "root"
+        
+        for folder_name in folders:
+            # 既存のフォルダを検索
+            query = f"name='{folder_name}' and '{current_parent}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            results = drive_service.files().list(q=query, fields="files(id)").execute()
+            
+            if results.get("files"):
+                current_parent = results["files"][0]["id"]
+            else:
+                # フォルダを作成（OAuthなので自分の容量を使用）
+                folder_metadata = {
+                    "name": folder_name,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [current_parent]
+                }
+                folder = drive_service.files().create(body=folder_metadata, fields="id").execute()
+                current_parent = folder["id"]
+        
+        return current_parent
 
-
-    def upload(self, path: str, parent_folder_id: str, service_account_json: str,
-               share_with_email: str = "", compress_folder: bool = True) -> Tuple[str, List]:
-        """Google Driveへファイルをアップロード"""
+    def upload(self, path: str, parent_folder_id: str = "", 
+               credentials_json: str = "", compress_folder: bool = True, 
+               create_parent_folder: bool = True) -> Tuple[str, List]:
+        """Google Driveへアップロード"""
         
         temp_zip_path = None
         
         try:
-            # 認証情報の読み込み
-            credentials = self._load_credentials(service_account_json)
-            drive_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+            # 認証
+            creds = self._get_credentials(credentials_json)
+            if not creds:
+                return ("エラー: 認証に失敗しました。credentials.jsonを確認してください", [])
             
-            if not parent_folder_id:
-                return ("エラー: parent_folder_id が指定されていません", [])
+            drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
             
             # パスの正規化
             path = os.path.abspath(path)
@@ -137,72 +206,104 @@ class GDriveUpload:
             if not os.path.exists(path):
                 return ("エラー: 指定されたパスが存在しません", [])
             
-            # アップロードするファイルのパスとファイル名を決定
-            if os.path.isdir(path) and compress_folder:
-                # フォルダをzipに圧縮
-                print(f"フォルダ '{path}' をzipに圧縮中...")
-                temp_zip_path = self._create_zip_from_folder(path)
-                upload_file_path = temp_zip_path
-                upload_file_name = self._get_zip_filename(path)
-            elif os.path.isdir(path) and not compress_folder:
-                # フォルダだが圧縮しない場合（個別ファイルをアップロード）
-                files_to_upload = []
-                for root, _, filenames in os.walk(path):
-                    for filename in filenames:
-                        files_to_upload.append(os.path.join(root, filename))
-                
-                if not files_to_upload:
-                    return ("エラー: フォルダ内にファイルが見つかりません", [])
-                
-                # 複数ファイルをアップロード
-                uploaded_info = []
-                for file_path in files_to_upload:
-                    try:
-                        file_metadata = {
-                            "name": os.path.relpath(file_path, path).replace(os.sep, '_'),
+            # parent_folder_idが空の場合はルートを使用
+            if not parent_folder_id:
+                parent_folder_id = "root"
+            
+            uploaded_info = []
+            
+            # ディレクトリの処理
+            if os.path.isdir(path):
+                # 親フォルダの決定
+                if create_parent_folder:
+                    # アップロードフォルダ名で親フォルダを作成
+                    folder_name = os.path.basename(path)
+                    
+                    # 既存のフォルダを検索
+                    query = f"name='{folder_name}' and '{parent_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+                    results = drive_service.files().list(q=query, fields="files(id)").execute()
+                    
+                    if results.get("files"):
+                        # 既存のフォルダを使用
+                        upload_parent_id = results["files"][0]["id"]
+                    else:
+                        # 新しいフォルダを作成
+                        folder_metadata = {
+                            "name": folder_name,
+                            "mimeType": "application/vnd.google-apps.folder",
                             "parents": [parent_folder_id]
                         }
-                        
-                        media = MediaFileUpload(
-                            file_path,
-                            mimetype=self._get_mime_type(file_path),
-                            resumable=True
-                        )
-                        
-                        uploaded_file = drive_service.files().create(
-                            body=file_metadata,
-                            media_body=media,
-                            fields="id,name,webViewLink,webContentLink"
-                        ).execute()
-                        
-                        self._share_file(drive_service, uploaded_file["id"], share_with_email)
-                        uploaded_info.append(uploaded_file.get("webViewLink", uploaded_file.get("webContentLink", "")))
-                        
-                    except Exception as e:
-                        print(f"ファイル {file_path} のアップロードに失敗: {e}")
-                        continue
-                
-                if uploaded_info:
-                    return (f"成功: {len(uploaded_info)}個のファイルをアップロードしました", uploaded_info)
+                        folder = drive_service.files().create(body=folder_metadata, fields="id").execute()
+                        upload_parent_id = folder["id"]
                 else:
-                    return ("エラー: ファイルのアップロードに失敗しました", [])
+                    # 親フォルダを作成せず、指定されたフォルダに直接アップロード
+                    upload_parent_id = parent_folder_id
+                
+                if compress_folder:
+                    # zipに圧縮してアップロード
+                    print(f"フォルダ '{path}' をzipに圧縮中...")
+                    temp_zip_path = self._create_zip_from_folder(path)
+                    
+                    file_metadata = {
+                        "name": self._get_zip_filename(path),
+                        "parents": [upload_parent_id]
+                    }
+                    
+                    media = MediaFileUpload(
+                        temp_zip_path,
+                        mimetype="application/zip",
+                        resumable=True
+                    )
+                    
+                    uploaded_file = drive_service.files().create(
+                        body=file_metadata,
+                        media_body=media,
+                        fields="id,name,webViewLink,webContentLink"
+                    ).execute()
+                    
+                    url = uploaded_file.get("webViewLink", uploaded_file.get("webContentLink", ""))
+                    return (f"成功: {uploaded_file['name']} をアップロードしました", [url] if url else [])
+                    
+                else:
+                    # フォルダ構造を維持してアップロード
+                    for root, _, filenames in os.walk(path):
+                        for filename in filenames:
+                            file_path = os.path.join(root, filename)
+                            
+                            # 親フォルダを作成
+                            target_parent = self._create_folder_structure(
+                                drive_service, path, file_path, upload_parent_id
+                            )
+                            
+                            # ファイルをアップロード
+                            file_metadata = {
+                                "name": filename,
+                                "parents": [target_parent]
+                            }
+                            
+                            media = MediaFileUpload(
+                                file_path,
+                                resumable=True
+                            )
+                            
+                            uploaded_file = drive_service.files().create(
+                                body=file_metadata,
+                                media_body=media,
+                                fields="id,name,webViewLink"
+                            ).execute()
+                            
+                            uploaded_info.append(uploaded_file.get("webViewLink", ""))
+                    
+                    if uploaded_info:
+                        return (f"成功: {len(uploaded_info)}個のファイルをアップロードしました", uploaded_info)
             else:
                 # 単一ファイルをアップロード
-                upload_file_path = path
-                upload_file_name = os.path.basename(path)
-            
-            # 単一ファイル（またはzip）をアップロード
-            try:
                 file_metadata = {
-                    "name": upload_file_name,
+                    "name": os.path.basename(path),
                     "parents": [parent_folder_id]
                 }
                 
-                media = MediaFileUpload(
-                    upload_file_path,
-                    mimetype=self._get_mime_type(upload_file_path),
-                    resumable=True
-                )
+                media = MediaFileUpload(path, resumable=True)
                 
                 uploaded_file = drive_service.files().create(
                     body=file_metadata,
@@ -210,26 +311,13 @@ class GDriveUpload:
                     fields="id,name,webViewLink,webContentLink"
                 ).execute()
                 
-                # 共有設定
-                self._share_file(drive_service, uploaded_file["id"], share_with_email)
-                
-                # URL取得
                 url = uploaded_file.get("webViewLink", uploaded_file.get("webContentLink", ""))
-                
-                if os.path.isdir(path) and compress_folder:
-                    status = f"成功: フォルダ '{os.path.basename(path)}' をzipとしてアップロードしました"
-                else:
-                    status = f"成功: ファイル '{upload_file_name}' をアップロードしました"
-                
-                return (status, [url] if url else [])
+                return (f"成功: {uploaded_file['name']} をアップロードしました", [url] if url else [])
             
-            except Exception as e:
-                return (f"エラー: アップロードに失敗しました: {e}", [])
+            return ("エラー: アップロードに失敗しました", [])
             
-        except ValueError as e:
-            return (f"エラー: {e}", [])
         except Exception as e:
-            return (f"エラー: {e}", [])
+            return (f"エラー: {str(e)}", [])
         finally:
             # 一時ファイルの削除
             if temp_zip_path and os.path.exists(temp_zip_path):
@@ -242,13 +330,14 @@ class GDriveUpload:
 # ls_node.pyからインポート
 from .ls_node import LS_NODE_CLASS_MAPPINGS, LS_NODE_DISPLAY_NAME_MAPPINGS
 
+# ノードマッピング
 NODE_CLASS_MAPPINGS = {
-    "GDriveUpload": GDriveUpload,
+    "GDriveUpload": GDriveUploadOAuth,
     **LS_NODE_CLASS_MAPPINGS
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "GDriveUpload": "Google Drive Upload (Direct JSON)",
+    "GDriveUpload": "Google Drive Upload (OAuth2.0)",
     **LS_NODE_DISPLAY_NAME_MAPPINGS
 }
 
