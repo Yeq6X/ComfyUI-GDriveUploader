@@ -13,15 +13,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# ComfyUIのinterrupt機能をインポート
-try:
-    import comfy.model_management as model_management
-    COMFY_AVAILABLE = True
-except ImportError:
-    COMFY_AVAILABLE = False
-
-# グローバル中断フラグ（ComfyUIのフラグと同期）
-_interrupt_flag = False
+# ComfyUI ProgressBar
+from comfy.utils import ProgressBar
 
 # スコープ設定
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -32,19 +25,6 @@ TOKEN_PATH = os.path.join(TOKEN_DIR, "token.pickle")
 CREDENTIALS_PATH = os.path.join(TOKEN_DIR, "credentials.json")
 
 
-def check_interrupt():
-    """ComfyUIの中断をチェック（正規版）"""
-    if COMFY_AVAILABLE:
-        try:
-            if hasattr(model_management, 'throw_exception_if_processing_interrupted'):
-                model_management.throw_exception_if_processing_interrupted()
-        except Exception as e:
-            if "InterruptProcessingException" in str(type(e)):
-                print("中断シグナル検出: アップロードを停止します")
-                raise InterruptedError("アップロードが中断されました")
-            else:
-                # その他の例外は再発生
-                raise
 
 class GDriveUploadOAuth:
     """
@@ -166,12 +146,8 @@ class GDriveUploadOAuth:
         temp_file.close()
         
         with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            file_count = 0
             for root, dirs, files in os.walk(folder_path):
                 for file in files:
-                    file_count += 1
-                    if file_count % 10 == 0:  # 10ファイルごとにチェック
-                        check_interrupt()
                     file_path = os.path.join(root, file)
                     arcname = os.path.relpath(file_path, folder_path)
                     zipf.write(file_path, arcname)
@@ -219,23 +195,22 @@ class GDriveUploadOAuth:
         
         temp_zip_path = None
         
+        # VideoCombineと同じ：ファイル数を取得してProgressBar作成
+        num_files = 0
+        if os.path.isdir(path):
+            for root, dirs, files in os.walk(path):
+                num_files += len(files)
+        else:
+            num_files = 1
+        pbar = ProgressBar(num_files)
+        
         try:
-            # ノードの実行開始時に中断フラグを明示的にリセット
-            if COMFY_AVAILABLE:
-                try:
-                    if hasattr(model_management, 'interrupt_current_processing'):
-                        model_management.interrupt_current_processing(False)
-                except Exception as e:
-                    print(f"中断フラグリセット中に警告: {e}")
-                    pass
             
             # 認証
-            check_interrupt()
             creds = self._get_credentials(credentials_json)
             if not creds:
                 return ("エラー: 認証に失敗しました。credentials.jsonを確認してください", [])
             
-            check_interrupt()
             drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
             
             # パスの正規化
@@ -279,10 +254,7 @@ class GDriveUploadOAuth:
                 
                 if compress_folder:
                     # zipに圧縮してアップロード
-                    check_interrupt()
                     temp_zip_path = self._create_zip_from_folder(path)
-                    
-                    check_interrupt()
                     
                     file_metadata = {
                         "name": self._get_zip_filename(path),
@@ -294,8 +266,6 @@ class GDriveUploadOAuth:
                         mimetype="application/zip",
                         resumable=True
                     )
-                    
-                    check_interrupt()
                     
                     uploaded_file = drive_service.files().create(
                         body=file_metadata,
@@ -310,9 +280,7 @@ class GDriveUploadOAuth:
                 else:
                     # フォルダ構造を維持してアップロード
                     for root, _, filenames in os.walk(path):
-                        check_interrupt()
                         for filename in filenames:
-                            check_interrupt()
                             file_path = os.path.join(root, filename)
                             
                             # 親フォルダを作成
@@ -331,8 +299,6 @@ class GDriveUploadOAuth:
                                 resumable=True
                             )
                             
-                            check_interrupt()
-                            
                             uploaded_file = drive_service.files().create(
                                 body=file_metadata,
                                 media_body=media,
@@ -341,6 +307,7 @@ class GDriveUploadOAuth:
                             
                             print(f"アップロード完了: {filename}")
                             uploaded_info.append(uploaded_file.get("webViewLink", ""))
+                            pbar.update(1)  # VideoCombineと同じプログレスバー更新
                     
                     if uploaded_info:
                         return (f"成功: {len(uploaded_info)}個のファイルをアップロードしました", uploaded_info)
@@ -365,10 +332,6 @@ class GDriveUploadOAuth:
             
             return ("エラー: アップロードに失敗しました", [])
             
-        except InterruptedError as e:
-            return (f"中断: {str(e)}", [])
-        except KeyboardInterrupt:
-            return ("中断: キーボード割り込みが発生しました", [])
         except Exception as e:
             return (f"エラー: {str(e)}", [])
         finally:
