@@ -148,15 +148,6 @@ Service Account版（storageQuotaExceededエラーが出る）から移行する
 - ワークフロー共有時は`credentials_json`欄を空にする
 - トークンファイルは共有しない
 
-## メリット（Service Account版との比較）
-
-| Service Account | OAuth2.0（本実装） |
-|---|---|
-| 容量制限あり（エラー多発） | **あなたのDrive容量を使用** |
-| フォルダ作成不可 | **自由にフォルダ作成** |
-| 共有設定が必要 | **共有不要** |
-| 設定が複雑 | **初回ブラウザ認証のみ** |
-
 ## ライセンス
 
 MIT License
