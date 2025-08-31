@@ -4,6 +4,7 @@ import zipfile
 import tempfile
 import pickle
 import webbrowser
+import time
 from typing import Tuple, List, Optional
 from datetime import datetime
 
@@ -13,8 +14,9 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# ComfyUI ProgressBar
+# ComfyUI modules
 from comfy.utils import ProgressBar
+import comfy.model_management as model_management
 
 # スコープ設定
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -58,9 +60,7 @@ class GDriveUploadOAuth:
                     "default": True,
                     "label": "アップロードフォルダ名で親フォルダを作成"
                 }),
-            },
-            "hidden": {
-                "unique_id": "UNIQUE_ID"
+                "unique_id": ("INT", {"default": 0}),
             }
         }
 
@@ -192,8 +192,12 @@ class GDriveUploadOAuth:
 
     def upload(self, path: str, parent_folder_id: str = "", 
                credentials_json: str = "", compress_folder: bool = True, 
-               create_parent_folder: bool = True, unique_id=None) -> Tuple[str, List]:
+               create_parent_folder: bool = True, unique_id=0) -> Tuple[str, List]:
         """Google Driveへアップロード"""
+        
+        # キャッシュ回避のためunique_idを自動生成  
+        if unique_id == 0:
+            unique_id = int(time.time() * 1000)
         
         temp_zip_path = None
         
@@ -283,6 +287,10 @@ class GDriveUploadOAuth:
                     # フォルダ構造を維持してアップロード
                     for root, _, filenames in os.walk(path):
                         for filename in filenames:
+                            # 中断チェック
+                            if model_management.interrupt_processing:
+                                return ("中断: アップロードが中断されました", uploaded_info)
+                            
                             file_path = os.path.join(root, filename)
                             
                             # 親フォルダを作成
@@ -335,7 +343,19 @@ class GDriveUploadOAuth:
             return ("エラー: アップロードに失敗しました", [])
             
         except Exception as e:
-            return (f"エラー: {str(e)}", [])
+            # ComfyUIの中断チェック
+            if model_management.interrupt_processing:
+                return ("中断: アップロードが中断されました", [])
+            
+            error_msg = str(e)
+            if not error_msg.strip():
+                # 中断やその他の理由でエラーメッセージが空の場合
+                error_msg = "処理が中断されました"
+            elif "interrupt" in error_msg.lower() or "cancel" in error_msg.lower():
+                error_msg = "アップロードが中断されました"
+            elif "keyboardinterrupt" in str(type(e)).lower():
+                error_msg = "キーボード割り込みにより中断されました"
+            return (f"エラー: {error_msg}", [])
         finally:
             # 一時ファイルの削除
             if temp_zip_path and os.path.exists(temp_zip_path):
