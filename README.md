@@ -5,8 +5,8 @@ ComfyUIで生成した画像や動画をGoogle Driveに直接アップロード�
 ## 特徴
 
 - **Service Account JSONを直接UIに貼り付け**（コンソール作業不要）
-- ファイル/ディレクトリの一括アップロード
-- フォルダ構造を維持したアップロード
+- **フォルダをzipに圧縮してアップロード**（容量エラー回避）
+- 単一ファイルのアップロード
 - 任意のメールアドレスへの共有設定
 - **List Directory (ls)ノード** - ディレクトリ内容を文字列として出力
 
@@ -40,11 +40,14 @@ pip install -r requirements.txt
 
 ### 3. Google Driveフォルダの共有設定
 
-1. アップロード先のGoogle Driveフォルダを開く
-2. 右クリック→「共有」
+**重要**: Service Accountには独自のストレージ容量がないため、**必ず既存のGoogle Driveフォルダを共有**してください。
+
+1. **あなたの個人Google Drive**でフォルダを作成（または既存フォルダを使用）
+2. フォルダを右クリック→「共有」
 3. Service AccountのメールアドレスをEditor権限で追加
    - メールアドレスは `xxxxx@project-name.iam.gserviceaccount.com` の形式
    - JSONファイルの `client_email` フィールドに記載されています
+4. **フォルダのオーナーはあなたのまま**（あなたのDrive容量を使用）
 
 ### 4. フォルダIDの取得
 
@@ -58,7 +61,7 @@ pip install -r requirements.txt
 ### ノードの設定
 
 1. **path**: アップロードするファイルまたはディレクトリのパス
-   - 例: `ComfyUI/output` (ディレクトリ全体)
+   - 例: `ComfyUI/output` (ディレクトリ全体をzipに)
    - 例: `ComfyUI/output/image.png` (単一ファイル)
 
 2. **parent_folder_id**: Google DriveのフォルダID
@@ -70,9 +73,9 @@ pip install -r requirements.txt
 4. **share_with_email** (オプション): 共有先のメールアドレス
    - アップロード後に自動的に共有されます
 
-5. **upload_subdirs**: サブディレクトリを含めるか
-   - True: フォルダ構造を維持してアップロード
-   - False: 直下のファイルのみアップロード
+5. **compress_folder**: フォルダをzipに圧縮するか（**デフォルト: True**）
+   - True: フォルダを1つのzipファイルとしてアップロード（推奨）
+   - False: フォルダ内のファイルを個別にアップロード
 
 ## セキュリティに関する注意
 
@@ -81,6 +84,16 @@ pip install -r requirements.txt
 - JSONファイルは安全な場所に保管し、公開リポジトリにコミットしないでください
 
 ## トラブルシューティング
+
+### 「storageQuotaExceeded」エラーが発生する場合
+
+**原因**: Service Accountには独自のストレージ容量がありません。
+
+**解決方法**:
+1. **あなたの個人Google Drive**でフォルダを作成
+2. そのフォルダをService Accountと**共有**（編集者権限）
+3. フォルダのオーナーはあなたのままにする
+4. **フォルダはzipに圧縮されてアップロード**されるため、フォルダ構造の問題を回避できます
 
 ### アップロードが失敗する場合
 

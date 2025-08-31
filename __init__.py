@@ -1,6 +1,8 @@
 import os
 import json
 import mimetypes
+import zipfile
+import tempfile
 from typing import Tuple, List
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -37,7 +39,10 @@ class GDriveUpload:
                     "multiline": False,
                     "placeholder": "共有先メールアドレス（オプション）"
                 }),
-                "upload_subdirs": ("BOOLEAN", {"default": True}),
+                "compress_folder": ("BOOLEAN", {
+                    "default": True,
+                    "label": "フォルダをzipに圧縮してアップロード"
+                }),
             }
         }
 
@@ -67,30 +72,31 @@ class GDriveUpload:
         mime_type, _ = mimetypes.guess_type(path)
         return mime_type or "application/octet-stream"
 
-    def _get_upload_files(self, path: str, upload_subdirs: bool) -> List[str]:
-        """アップロード対象のファイルリストを取得"""
-        files = []
+    def _create_zip_from_folder(self, folder_path: str) -> str:
+        """フォルダをzipファイルに圧縮して一時ファイルパスを返す"""
+        # 一時ファイルを作成
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+        temp_path = temp_file.name
+        temp_file.close()
         
-        # パスの正規化
-        path = os.path.abspath(path)
+        # zipファイルを作成
+        with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(folder_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    # アーカイブ内のパスを相対パスにする
+                    arcname = os.path.relpath(file_path, folder_path)
+                    zipf.write(file_path, arcname)
         
-        if os.path.isfile(path):
-            files.append(path)
-        elif os.path.isdir(path):
-            if upload_subdirs:
-                # サブディレクトリを含む全ファイル
-                for root, _, filenames in os.walk(path):
-                    for filename in filenames:
-                        files.append(os.path.join(root, filename))
-            else:
-                # 直下のファイルのみ
-                for filename in os.listdir(path):
-                    filepath = os.path.join(path, filename)
-                    if os.path.isfile(filepath):
-                        files.append(filepath)
-        
-        return files
+        return temp_path
 
+    def _get_zip_filename(self, folder_path: str) -> str:
+        """フォルダ名からzipファイル名を生成"""
+        folder_name = os.path.basename(folder_path)
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"{folder_name}_{timestamp}.zip"
+    
     def _share_file(self, drive_service, file_id: str, email: str):
         """ファイルを指定のメールアドレスと共有"""
         if not email:
@@ -110,38 +116,12 @@ class GDriveUpload:
         except Exception as e:
             print(f"共有設定に失敗しました: {e}")
 
-    def _create_folder_structure(self, drive_service, base_path: str, file_path: str, parent_id: str) -> str:
-        """必要に応じてフォルダ構造を作成し、最終的な親フォルダIDを返す"""
-        rel_path = os.path.relpath(os.path.dirname(file_path), base_path)
-        
-        if rel_path == ".":
-            return parent_id
-        
-        folders = rel_path.split(os.sep)
-        current_parent = parent_id
-        
-        for folder_name in folders:
-            # 既存のフォルダを検索
-            query = f"name='{folder_name}' and '{current_parent}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            results = drive_service.files().list(q=query, fields="files(id)").execute()
-            
-            if results.get("files"):
-                current_parent = results["files"][0]["id"]
-            else:
-                # フォルダを作成
-                folder_metadata = {
-                    "name": folder_name,
-                    "mimeType": "application/vnd.google-apps.folder",
-                    "parents": [current_parent]
-                }
-                folder = drive_service.files().create(body=folder_metadata, fields="id").execute()
-                current_parent = folder["id"]
-        
-        return current_parent
 
     def upload(self, path: str, parent_folder_id: str, service_account_json: str,
-               share_with_email: str = "", upload_subdirs: bool = True) -> Tuple[str, List]:
+               share_with_email: str = "", compress_folder: bool = True) -> Tuple[str, List]:
         """Google Driveへファイルをアップロード"""
+        
+        temp_zip_path = None
         
         try:
             # 認証情報の読み込み
@@ -151,68 +131,112 @@ class GDriveUpload:
             if not parent_folder_id:
                 return ("エラー: parent_folder_id が指定されていません", [])
             
-            # アップロード対象ファイルの取得
-            files_to_upload = self._get_upload_files(path, upload_subdirs)
+            # パスの正規化
+            path = os.path.abspath(path)
             
-            if not files_to_upload:
-                return ("エラー: アップロード対象のファイルが見つかりません", [])
+            if not os.path.exists(path):
+                return ("エラー: 指定されたパスが存在しません", [])
             
-            uploaded_info = []
-            base_path = path if os.path.isdir(path) else os.path.dirname(path)
-            
-            for file_path in files_to_upload:
-                try:
-                    # フォルダ構造を維持する場合は親フォルダを作成
-                    if os.path.isdir(path) and upload_subdirs:
-                        target_parent = self._create_folder_structure(
-                            drive_service, base_path, file_path, parent_folder_id
+            # アップロードするファイルのパスとファイル名を決定
+            if os.path.isdir(path) and compress_folder:
+                # フォルダをzipに圧縮
+                print(f"フォルダ '{path}' をzipに圧縮中...")
+                temp_zip_path = self._create_zip_from_folder(path)
+                upload_file_path = temp_zip_path
+                upload_file_name = self._get_zip_filename(path)
+            elif os.path.isdir(path) and not compress_folder:
+                # フォルダだが圧縮しない場合（個別ファイルをアップロード）
+                files_to_upload = []
+                for root, _, filenames in os.walk(path):
+                    for filename in filenames:
+                        files_to_upload.append(os.path.join(root, filename))
+                
+                if not files_to_upload:
+                    return ("エラー: フォルダ内にファイルが見つかりません", [])
+                
+                # 複数ファイルをアップロード
+                uploaded_info = []
+                for file_path in files_to_upload:
+                    try:
+                        file_metadata = {
+                            "name": os.path.relpath(file_path, path).replace(os.sep, '_'),
+                            "parents": [parent_folder_id]
+                        }
+                        
+                        media = MediaFileUpload(
+                            file_path,
+                            mimetype=self._get_mime_type(file_path),
+                            resumable=True
                         )
-                    else:
-                        target_parent = parent_folder_id
-                    
-                    # ファイルのアップロード
-                    file_metadata = {
-                        "name": os.path.basename(file_path),
-                        "parents": [target_parent]
-                    }
-                    
-                    media = MediaFileUpload(
-                        file_path,
-                        mimetype=self._get_mime_type(file_path),
-                        resumable=True
-                    )
-                    
-                    uploaded_file = drive_service.files().create(
-                        body=file_metadata,
-                        media_body=media,
-                        fields="id,name,webViewLink,webContentLink"
-                    ).execute()
-                    
-                    # 共有設定
-                    self._share_file(drive_service, uploaded_file["id"], share_with_email)
-                    
-                    # アップロード情報を記録
-                    uploaded_info.append({
-                        "name": uploaded_file["name"],
-                        "id": uploaded_file["id"],
-                        "url": uploaded_file.get("webViewLink", uploaded_file.get("webContentLink", ""))
-                    })
-                    
-                except Exception as e:
-                    print(f"ファイル {file_path} のアップロードに失敗: {e}")
-                    continue
-            
-            if uploaded_info:
-                urls = [info["url"] for info in uploaded_info if info["url"]]
-                status = f"成功: {len(uploaded_info)}個のファイルをアップロードしました"
-                return (status, urls)
+                        
+                        uploaded_file = drive_service.files().create(
+                            body=file_metadata,
+                            media_body=media,
+                            fields="id,name,webViewLink,webContentLink"
+                        ).execute()
+                        
+                        self._share_file(drive_service, uploaded_file["id"], share_with_email)
+                        uploaded_info.append(uploaded_file.get("webViewLink", uploaded_file.get("webContentLink", "")))
+                        
+                    except Exception as e:
+                        print(f"ファイル {file_path} のアップロードに失敗: {e}")
+                        continue
+                
+                if uploaded_info:
+                    return (f"成功: {len(uploaded_info)}個のファイルをアップロードしました", uploaded_info)
+                else:
+                    return ("エラー: ファイルのアップロードに失敗しました", [])
             else:
-                return ("エラー: ファイルのアップロードに失敗しました", [])
+                # 単一ファイルをアップロード
+                upload_file_path = path
+                upload_file_name = os.path.basename(path)
+            
+            # 単一ファイル（またはzip）をアップロード
+            try:
+                file_metadata = {
+                    "name": upload_file_name,
+                    "parents": [parent_folder_id]
+                }
+                
+                media = MediaFileUpload(
+                    upload_file_path,
+                    mimetype=self._get_mime_type(upload_file_path),
+                    resumable=True
+                )
+                
+                uploaded_file = drive_service.files().create(
+                    body=file_metadata,
+                    media_body=media,
+                    fields="id,name,webViewLink,webContentLink"
+                ).execute()
+                
+                # 共有設定
+                self._share_file(drive_service, uploaded_file["id"], share_with_email)
+                
+                # URL取得
+                url = uploaded_file.get("webViewLink", uploaded_file.get("webContentLink", ""))
+                
+                if os.path.isdir(path) and compress_folder:
+                    status = f"成功: フォルダ '{os.path.basename(path)}' をzipとしてアップロードしました"
+                else:
+                    status = f"成功: ファイル '{upload_file_name}' をアップロードしました"
+                
+                return (status, [url] if url else [])
+            
+            except Exception as e:
+                return (f"エラー: アップロードに失敗しました: {e}", [])
             
         except ValueError as e:
             return (f"エラー: {e}", [])
         except Exception as e:
             return (f"エラー: {e}", [])
+        finally:
+            # 一時ファイルの削除
+            if temp_zip_path and os.path.exists(temp_zip_path):
+                try:
+                    os.unlink(temp_zip_path)
+                except:
+                    pass
 
 
 # ls_node.pyからインポート
