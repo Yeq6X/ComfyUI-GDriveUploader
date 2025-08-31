@@ -345,6 +345,7 @@ class GDriveUploadOAuth:
                         fields="id,name,webViewLink,webContentLink"
                     ).execute()
                     
+                    print(f"アップロード完了: {uploaded_file['name']}")
                     url = uploaded_file.get("webViewLink", uploaded_file.get("webContentLink", ""))
                     return (f"成功: {uploaded_file['name']} をアップロードしました", [url] if url else [])
                     
@@ -380,6 +381,7 @@ class GDriveUploadOAuth:
                                 fields="id,name,webViewLink"
                             ).execute()
                             
+                            print(f"アップロード完了: {filename}")
                             uploaded_info.append(uploaded_file.get("webViewLink", ""))
                     
                     if uploaded_info:
@@ -399,6 +401,7 @@ class GDriveUploadOAuth:
                     fields="id,name,webViewLink,webContentLink"
                 ).execute()
                 
+                print(f"アップロード完了: {uploaded_file['name']}")
                 url = uploaded_file.get("webViewLink", uploaded_file.get("webContentLink", ""))
                 return (f"成功: {uploaded_file['name']} をアップロードしました", [url] if url else [])
             
