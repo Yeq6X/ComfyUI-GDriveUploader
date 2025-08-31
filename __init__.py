@@ -49,8 +49,11 @@ def check_interrupt():
     """ComfyUIの中断をチェック"""
     global _should_interrupt
     
+    print(f"DEBUG: 中断チェック開始 - 独自フラグ: {_should_interrupt}")
+    
     # 独自の中断フラグをチェック
     if _should_interrupt:
+        print("DEBUG: 独自中断フラグがTrueのため中断")
         raise InterruptedError("アップロードが中断されました")
     
     # ComfyUIの正式なinterrupt機能を使用
@@ -58,11 +61,17 @@ def check_interrupt():
         try:
             # model_management.processing_interrupted() が正式な方法
             if hasattr(model_management, 'processing_interrupted'):
-                if model_management.processing_interrupted():
+                interrupted = model_management.processing_interrupted()
+                print(f"DEBUG: ComfyUI中断フラグ: {interrupted}")
+                if interrupted:
+                    print("DEBUG: ComfyUI中断フラグがTrueのため中断")
                     raise InterruptedError("アップロードが中断されました")
                         
-        except (AttributeError, NameError, TypeError, ImportError):
+        except (AttributeError, NameError, TypeError, ImportError) as e:
+            print(f"DEBUG: 中断チェックエラー: {e}")
             pass
+    
+    print("DEBUG: 中断チェック完了（中断なし）")
 
 class GDriveUploadOAuth:
     """
@@ -183,15 +192,19 @@ class GDriveUploadOAuth:
         temp_path = temp_file.name
         temp_file.close()
         
+        print("DEBUG: zip圧縮開始")
         with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            file_count = 0
             for root, dirs, files in os.walk(folder_path):
-                check_interrupt()
                 for file in files:
-                    check_interrupt()
+                    file_count += 1
+                    if file_count % 10 == 0:  # 10ファイルごとにチェック
+                        check_interrupt()
                     file_path = os.path.join(root, file)
                     arcname = os.path.relpath(file_path, folder_path)
                     zipf.write(file_path, arcname)
         
+        print(f"DEBUG: zip圧縮完了 - {file_count}個のファイル")
         return temp_path
 
     def _get_zip_filename(self, folder_path: str) -> str:
@@ -237,25 +250,35 @@ class GDriveUploadOAuth:
         temp_zip_path = None
         
         try:
+            print("DEBUG: アップロード開始")
+            
             # 処理開始時は中断フラグをクリア
             clear_interrupt()
+            print("DEBUG: 独自中断フラグをクリア")
             
             # ComfyUIの中断フラグもリセット
             if COMFY_AVAILABLE:
                 try:
                     if hasattr(model_management, 'interrupt_current_processing'):
                         model_management.interrupt_current_processing(False)
-                except (AttributeError, TypeError):
-                    pass
+                        print("DEBUG: ComfyUI中断フラグをリセット")
+                except (AttributeError, TypeError) as e:
+                    print(f"DEBUG: 中断フラグリセットエラー: {e}")
             
             # 認証
+            print("DEBUG: 認証開始前の中断チェック")
             check_interrupt()
+            print("DEBUG: 認証開始")
             creds = self._get_credentials(credentials_json)
             if not creds:
+                print("DEBUG: 認証失敗")
                 return ("エラー: 認証に失敗しました。credentials.jsonを確認してください", [])
+            print("DEBUG: 認証成功")
             
             check_interrupt()
+            print("DEBUG: Drive APIサービス構築中")
             drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+            print("DEBUG: Drive APIサービス構築完了")
             
             # パスの正規化
             path = os.path.abspath(path)
@@ -382,10 +405,16 @@ class GDriveUploadOAuth:
             return ("エラー: アップロードに失敗しました", [])
             
         except InterruptedError as e:
+            print(f"DEBUG: InterruptedError発生: {e}")
             return (f"中断: {str(e)}", [])
         except KeyboardInterrupt:
+            print("DEBUG: KeyboardInterrupt発生")
             return ("中断: キーボード割り込みが発生しました", [])
         except Exception as e:
+            print(f"DEBUG: Exception発生: {e}")
+            print(f"DEBUG: Exception type: {type(e)}")
+            import traceback
+            print(f"DEBUG: Traceback: {traceback.format_exc()}")
             return (f"エラー: {str(e)}", [])
         finally:
             # 一時ファイルの削除
