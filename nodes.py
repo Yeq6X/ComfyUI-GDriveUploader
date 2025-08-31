@@ -58,6 +58,9 @@ class GDriveUploadOAuth:
                     "default": True,
                     "label": "アップロードフォルダ名で親フォルダを作成"
                 }),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID"
             }
         }
 
@@ -189,7 +192,7 @@ class GDriveUploadOAuth:
 
     def upload(self, path: str, parent_folder_id: str = "", 
                credentials_json: str = "", compress_folder: bool = True, 
-               create_parent_folder: bool = True) -> Tuple[str, List]:
+               create_parent_folder: bool = True, unique_id=None) -> Tuple[str, List]:
         """Google Driveへアップロード"""
         
         temp_zip_path = None
