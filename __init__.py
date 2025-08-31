@@ -13,6 +13,16 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
+# ComfyUIのinterrupt機能をインポート
+try:
+    import comfy.model_management as model_management
+    COMFY_AVAILABLE = True
+except ImportError:
+    COMFY_AVAILABLE = False
+
+# グローバル中断フラグ（ComfyUIのフラグと同期）
+_interrupt_flag = False
+
 # スコープ設定
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
@@ -21,6 +31,38 @@ TOKEN_DIR = os.path.expanduser("~/.comfyui-gdrive")
 TOKEN_PATH = os.path.join(TOKEN_DIR, "token.pickle")
 CREDENTIALS_PATH = os.path.join(TOKEN_DIR, "credentials.json")
 
+
+# グローバルな中断フラグ
+_should_interrupt = False
+
+def set_interrupt():
+    """中断フラグを設定"""
+    global _should_interrupt
+    _should_interrupt = True
+
+def clear_interrupt():
+    """中断フラグをクリア"""
+    global _should_interrupt
+    _should_interrupt = False
+
+def check_interrupt():
+    """ComfyUIの中断をチェック"""
+    global _should_interrupt
+    
+    # 独自の中断フラグをチェック
+    if _should_interrupt:
+        raise InterruptedError("アップロードが中断されました")
+    
+    # ComfyUIの正式なinterrupt機能を使用
+    if COMFY_AVAILABLE:
+        try:
+            # model_management.processing_interrupted() が正式な方法
+            if hasattr(model_management, 'processing_interrupted'):
+                if model_management.processing_interrupted():
+                    raise InterruptedError("アップロードが中断されました")
+                        
+        except (AttributeError, NameError, TypeError, ImportError):
+            pass
 
 class GDriveUploadOAuth:
     """
@@ -143,7 +185,9 @@ class GDriveUploadOAuth:
         
         with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for root, dirs, files in os.walk(folder_path):
+                check_interrupt()
                 for file in files:
+                    check_interrupt()
                     file_path = os.path.join(root, file)
                     arcname = os.path.relpath(file_path, folder_path)
                     zipf.write(file_path, arcname)
@@ -193,11 +237,24 @@ class GDriveUploadOAuth:
         temp_zip_path = None
         
         try:
+            # 処理開始時は中断フラグをクリア
+            clear_interrupt()
+            
+            # ComfyUIの中断フラグもリセット
+            if COMFY_AVAILABLE:
+                try:
+                    if hasattr(model_management, 'interrupt_current_processing'):
+                        model_management.interrupt_current_processing(False)
+                except (AttributeError, TypeError):
+                    pass
+            
             # 認証
+            check_interrupt()
             creds = self._get_credentials(credentials_json)
             if not creds:
                 return ("エラー: 認証に失敗しました。credentials.jsonを確認してください", [])
             
+            check_interrupt()
             drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
             
             # パスの正規化
@@ -241,8 +298,10 @@ class GDriveUploadOAuth:
                 
                 if compress_folder:
                     # zipに圧縮してアップロード
-                    print(f"フォルダ '{path}' をzipに圧縮中...")
+                    check_interrupt()
                     temp_zip_path = self._create_zip_from_folder(path)
+                    
+                    check_interrupt()
                     
                     file_metadata = {
                         "name": self._get_zip_filename(path),
@@ -254,6 +313,8 @@ class GDriveUploadOAuth:
                         mimetype="application/zip",
                         resumable=True
                     )
+                    
+                    check_interrupt()
                     
                     uploaded_file = drive_service.files().create(
                         body=file_metadata,
@@ -267,7 +328,9 @@ class GDriveUploadOAuth:
                 else:
                     # フォルダ構造を維持してアップロード
                     for root, _, filenames in os.walk(path):
+                        check_interrupt()
                         for filename in filenames:
+                            check_interrupt()
                             file_path = os.path.join(root, filename)
                             
                             # 親フォルダを作成
@@ -285,6 +348,8 @@ class GDriveUploadOAuth:
                                 file_path,
                                 resumable=True
                             )
+                            
+                            check_interrupt()
                             
                             uploaded_file = drive_service.files().create(
                                 body=file_metadata,
@@ -316,6 +381,10 @@ class GDriveUploadOAuth:
             
             return ("エラー: アップロードに失敗しました", [])
             
+        except InterruptedError as e:
+            return (f"中断: {str(e)}", [])
+        except KeyboardInterrupt:
+            return ("中断: キーボード割り込みが発生しました", [])
         except Exception as e:
             return (f"エラー: {str(e)}", [])
         finally:
