@@ -33,14 +33,18 @@ CREDENTIALS_PATH = os.path.join(TOKEN_DIR, "credentials.json")
 
 
 def check_interrupt():
-    """ComfyUIの中断をチェック"""
+    """ComfyUIの中断をチェック（正規版）"""
     if COMFY_AVAILABLE:
         try:
-            if hasattr(model_management, 'processing_interrupted'):
-                if model_management.processing_interrupted():
-                    raise InterruptedError("アップロードが中断されました")
-        except (AttributeError, NameError, TypeError, ImportError):
-            pass
+            if hasattr(model_management, 'throw_exception_if_processing_interrupted'):
+                model_management.throw_exception_if_processing_interrupted()
+        except Exception as e:
+            if "InterruptProcessingException" in str(type(e)):
+                print("中断シグナル検出: アップロードを停止します")
+                raise InterruptedError("アップロードが中断されました")
+            else:
+                # その他の例外は再発生
+                raise
 
 class GDriveUploadOAuth:
     """
@@ -216,6 +220,15 @@ class GDriveUploadOAuth:
         temp_zip_path = None
         
         try:
+            # ノードの実行開始時に中断フラグを明示的にリセット
+            if COMFY_AVAILABLE:
+                try:
+                    if hasattr(model_management, 'interrupt_current_processing'):
+                        model_management.interrupt_current_processing(False)
+                except Exception as e:
+                    print(f"中断フラグリセット中に警告: {e}")
+                    pass
+            
             # 認証
             check_interrupt()
             creds = self._get_credentials(credentials_json)
